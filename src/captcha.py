@@ -791,7 +791,8 @@ class EnhancedCaptchaSolver:
         """Helper for local OCR solving (thread-safe wrapper)"""
         try:
              logger.info(f"[{location}] Trying local ddddocr (Enhanced)...")
-             result = self.ocr.predict(image_bytes)
+             # FIX: Use classification() instead of predict()
+             result = self.ocr.classification(image_bytes)
 
              result = result.replace(" ", "").strip().lower()
              result = self._clean_ocr_result(result)
@@ -1255,6 +1256,7 @@ class CaptchaSolver:
         if not self.ocr:
             return ""
         try:
+            # FIX: Use classification() instead of predict()
             res = self.ocr.classification(image_bytes)
             res = res.replace(" ", "").strip()
             print(f"[AI] Captcha Solved: {res}")
