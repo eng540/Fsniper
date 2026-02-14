@@ -1,0 +1,18 @@
+# Core Automation
+playwright==1.58.0
+
+# CAPTCHA & Image Processing
+ddddocr==1.4.11
+opencv-python-headless>=4.8.0
+Pillow>=10.2.0
+numpy<2
+
+# Time & Environment
+ntplib>=0.4.0
+pytz>=2024.1
+python-dateutil>=2.8.2
+python-dotenv>=1.0.0
+
+# Network & Logging
+requests>=2.31.0
+loguru>=0.7.2
