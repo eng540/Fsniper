@@ -293,6 +293,7 @@ class EnhancedCaptchaSolver:
         self.c2 = c2_instance # Store C2 instance
         
         self.ocr = None
+        self.ocr_method = None  # Will store the correct OCR method
         self._pre_solved_code: Optional[str] = None
         self._pre_solved_time: float = 0.0
         self._pre_solve_timeout: float = 30.0  # Pre-solved code expires after 30s
@@ -301,9 +302,6 @@ class EnhancedCaptchaSolver:
         self.capsolver = CapSolverHandler()
         
         # Initialize manual captcha handler (Telegram fallback)
-        
-        # Initialize manual captcha handler (Telegram fallback)
-        # Check if enabled in config AND in compatbile mode
         self.manual_handler = TelegramCaptchaHandler()
         if self.c2:
             self.manual_handler.c2 = self.c2 # Inject C2 into handler
@@ -315,14 +313,27 @@ class EnhancedCaptchaSolver:
         else:
              logger.info("[CAPTCHA] Initialized in HYBRID MODE (Balanced)")
         
+        # Initialize OCR with compatibility check
         if DDDDOCR_AVAILABLE and not self.manual_only:
             try:
-                # !!! تراجع هام: العودة لاستخدام Beta=True لأنها أثبتت كفاءة أعلى !!!
+                # !!! Important: Using Beta=True for higher accuracy !!!
                 self.ocr = ddddocr.DdddOcr(beta=True)
-                logger.info("Captcha solver initialized (BETA Mode - High Accuracy)")
+                
+                # Check which method is available (compatibility with different versions)
+                if hasattr(self.ocr, 'classification'):
+                    self.ocr_method = self.ocr.classification
+                    logger.info("Captcha solver initialized (Using classification method - New API)")
+                elif hasattr(self.ocr, 'predict'):
+                    self.ocr_method = self.ocr.predict
+                    logger.info("Captcha solver initialized (Using predict method - Old API)")
+                else:
+                    self.ocr_method = None
+                    logger.error("No valid OCR method found in ddddocr instance")
+                    
             except Exception as e:
                 logger.error(f"Captcha solver init failed: {e}")
                 self.ocr = None
+                self.ocr_method = None
         elif not DDDDOCR_AVAILABLE and not self.manual_only:
             logger.warning("ddddocr not available - captcha solving disabled")
     
@@ -627,7 +638,7 @@ class EnhancedCaptchaSolver:
         # 4-5 chars - REJECT! Embassy requires exactly 6 chars
         # OCR probably missed a character
         if code_len in [4, 5]:
-            logger.warning(f"[{location}] OCR incomplete: '{code}' ({code_len} chars) -需要6个字符!")
+            logger.warning(f"[{location}] OCR incomplete: '{code}' ({code_len} chars) - نیاز به 6 کاراکتر!")
             return False, "TOO_SHORT"
 
     def _preprocess_image(self, image_bytes: bytes) -> bytes:
@@ -668,6 +679,7 @@ class EnhancedCaptchaSolver:
         except Exception as e:
             logger.debug(f"Image preprocessing failed: {e}")
             return image_bytes
+    
     def solve(self, image_bytes: bytes, location: str = "SOLVE") -> Tuple[str, str]:
         """
         Solve captcha from image bytes with validation
@@ -684,8 +696,8 @@ class EnhancedCaptchaSolver:
              logger.info(f"[{location}] Manual Mode active - Skipping OCR")
              return "", "MANUAL_REQUIRED"
 
-        if not self.ocr:
-            logger.error("[OCR] Engine not initialized")
+        if not self.ocr_method:
+            logger.error("[OCR] OCR method not initialized")
             return "", "NO_OCR"
         
         try:
@@ -701,7 +713,7 @@ class EnhancedCaptchaSolver:
             # STRATEGY: PARALLEL SOLVING (RACE) vs SEQUENTIAL
             # ═══════════════════════════════════════════════════════════════
             
-            if Config.PARALLEL_SOLVING_ENABLED and self.capsolver.enabled and self.ocr:
+            if Config.PARALLEL_SOLVING_ENABLED and self.capsolver.enabled and self.ocr_method:
                  logger.info(f"[{location}] 🚀 STARTING PARALLEL RACE: CapSolver vs Local OCR")
                  
                  with ThreadPoolExecutor(max_workers=2) as executor:
@@ -776,7 +788,7 @@ class EnhancedCaptchaSolver:
                 logger.warning(f"[{location}] CapSolver failed - Falling back to local OCR...")
 
             # PRIORITY 2: LOCAL DDDDOCR (FREE/FALLBACK)
-            if self.ocr:
+            if self.ocr_method:
                  result, status = self._solve_local_ocr(enhanced_bytes, location)
                  if status in ["VALID", "AGING_7", "AGING_8"]:
                      return result, status
@@ -791,8 +803,9 @@ class EnhancedCaptchaSolver:
         """Helper for local OCR solving (thread-safe wrapper)"""
         try:
              logger.info(f"[{location}] Trying local ddddocr (Enhanced)...")
-             # FIX: Use classification() instead of predict()
-             result = self.ocr.classification(image_bytes)
+             
+             # Use the pre-detected OCR method for compatibility
+             result = self.ocr_method(image_bytes)
 
              result = result.replace(" ", "").strip().lower()
              result = self._clean_ocr_result(result)
@@ -906,7 +919,7 @@ class EnhancedCaptchaSolver:
         session_age: int = 0,
         attempt: int = 1,
         max_attempts: int = 5
-    ) -> Tuple[bool, Optional[str]]:
+    ) -> Tuple[bool, Optional[str], str]:
         """
         Complete captcha solving workflow
         Uses pre-solved code if available, then OCR, then manual Telegram fallback
@@ -1256,8 +1269,11 @@ class CaptchaSolver:
         if not self.ocr:
             return ""
         try:
-            # FIX: Use classification() instead of predict()
-            res = self.ocr.classification(image_bytes)
+            # Use classification method for new versions, fallback to predict for old versions
+            if hasattr(self.ocr, 'classification'):
+                res = self.ocr.classification(image_bytes)
+            else:
+                res = self.ocr.predict(image_bytes)
             res = res.replace(" ", "").strip()
             print(f"[AI] Captcha Solved: {res}")
             return res
