@@ -11,9 +11,8 @@ import numpy as np
 import requests
 import json
 import base64
-import concurrent.futures
+import concurrent.futures # For parallel solving
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
 try:
     import cv2
     OPENCV_AVAILABLE = True
@@ -32,7 +31,6 @@ except ImportError:
 
 # Import config and notifier for manual captcha
 from .config import Config
-
 try:
     from . import notifier
     NOTIFIER_AVAILABLE = True
@@ -91,13 +89,18 @@ class TelegramCaptchaHandler:
         success = False
         if hasattr(self, 'c2') and self.c2:
             try:
+                # Save bytes to temp file or handle bytes directly?
+                # C2.send_photo takes path... 
+                # Let's fallback to notifier for sending, but use C2 for receiving.
+                # Or improve C2 to handle bytes? Not critical now.
+                # Notifier uses requests directly, which is fine.
                 result = notifier.send_photo_bytes(image_bytes, caption)
                 success = result.get("success")
             except:
                 pass
         else:
-            result = notifier.send_photo_bytes(image_bytes, caption)
-            success = result.get("success")
+             result = notifier.send_photo_bytes(image_bytes, caption)
+             success = result.get("success")
         
         if not success:
             logger.error("[MANUAL] Failed to send captcha to Telegram")
@@ -125,12 +128,12 @@ class TelegramCaptchaHandler:
             notifier.send_alert(f"❌ CAPTCHA WRONG - sending new image...")
 
 
+
 class CircuitBreaker:
     """
     Circuit Breaker pattern to handle API failures gracefully.
     If failure threshold is reached, open the circuit for a timeout period.
     """
-    
     def __init__(self, threshold: int = 2, timeout: int = 300):
         self.threshold = threshold
         self.timeout = timeout
@@ -165,11 +168,11 @@ class CircuitBreaker:
         if elapsed > self.timeout:
             if self.state == "OPEN":
                 logger.info("⚡ [CircuitBreaker] Timeout expired - Switch to HALF-OPEN")
-                self.state = "HALF-OPEN"
-                return False
-            return False
+                self.state = "HALF-OPEN" # Allow one trial request
+                return False # Allow passage for trial
+            return False # HALF-OPEN or resets
             
-        return True
+        return True # Still open and within timeout
 
 
 class CapSolverHandler:
@@ -221,7 +224,7 @@ class CapSolverHandler:
                 "clientKey": self.api_key,
                 "task": {
                     "type": "ImageToTextTask",
-                    "module": "common",
+                    "module": "common",  # "common" or "number" - common is safer for alphanum
                     "body": image_base64
                 }
             }
@@ -229,6 +232,7 @@ class CapSolverHandler:
             start_time = time.time()
             logger.info(f"[{location}] Sending request to CapSolver...")
             
+            # Send request (createTask for ImageToText returns result immediately usually)
             response = requests.post(
                 self.api_url, 
                 json=payload, 
@@ -269,6 +273,8 @@ class CapSolverHandler:
             return None, "EXCEPTION"
 
 
+
+
 class EnhancedCaptchaSolver:
     """
     Enhanced captcha solver with:
@@ -284,12 +290,13 @@ class EnhancedCaptchaSolver:
         self.mode = mode.upper()
         self.manual_only = (self.mode == "MANUAL")
         self.auto_only = (self.mode == "AUTO")
-        self.c2 = c2_instance
+        self.c2 = c2_instance # Store C2 instance
         
         self.ocr = None
+        self.ocr_method = None  # Will store the correct OCR method
         self._pre_solved_code: Optional[str] = None
         self._pre_solved_time: float = 0.0
-        self._pre_solve_timeout: float = 30.0
+        self._pre_solve_timeout: float = 30.0  # Pre-solved code expires after 30s
         
         # Initialize CapSolver
         self.capsolver = CapSolverHandler()
@@ -297,22 +304,36 @@ class EnhancedCaptchaSolver:
         # Initialize manual captcha handler (Telegram fallback)
         self.manual_handler = TelegramCaptchaHandler()
         if self.c2:
-            self.manual_handler.c2 = self.c2
+            self.manual_handler.c2 = self.c2 # Inject C2 into handler
         
         if self.mode == "MANUAL":
-            logger.info("[CAPTCHA] Initialized in MANUAL MODE (OCR Disabled)")
+             logger.info("[CAPTCHA] Initialized in MANUAL MODE (OCR Disabled)")
         elif self.mode == "AUTO":
-            logger.info("[CAPTCHA] Initialized in AUTO MODE (Manual Fallback Disabled)")
+             logger.info("[CAPTCHA] Initialized in AUTO MODE (Manual Fallback Disabled)")
         else:
-            logger.info("[CAPTCHA] Initialized in HYBRID MODE (Balanced)")
+             logger.info("[CAPTCHA] Initialized in HYBRID MODE (Balanced)")
         
+        # Initialize OCR with compatibility check
         if DDDDOCR_AVAILABLE and not self.manual_only:
             try:
+                # !!! Important: Using Beta=True for higher accuracy !!!
                 self.ocr = ddddocr.DdddOcr(beta=True)
-                logger.info("Captcha solver initialized (BETA Mode - High Accuracy)")
+                
+                # Check which method is available (compatibility with different versions)
+                if hasattr(self.ocr, 'classification'):
+                    self.ocr_method = self.ocr.classification
+                    logger.info("Captcha solver initialized (Using classification method - New API)")
+                elif hasattr(self.ocr, 'predict'):
+                    self.ocr_method = self.ocr.predict
+                    logger.info("Captcha solver initialized (Using predict method - Old API)")
+                else:
+                    self.ocr_method = None
+                    logger.error("No valid OCR method found in ddddocr instance")
+                    
             except Exception as e:
                 logger.error(f"Captcha solver init failed: {e}")
                 self.ocr = None
+                self.ocr_method = None
         elif not DDDDOCR_AVAILABLE and not self.manual_only:
             logger.warning("ddddocr not available - captcha solving disabled")
     
@@ -332,7 +353,7 @@ class EnhancedCaptchaSolver:
                 "security code", 
                 "verification", 
                 "human check",
-                "verkaptxt"
+                "verkaptxt"  # German sites
             ]
             
             has_captcha_text = any(keyword in page_content for keyword in captcha_keywords)
@@ -342,6 +363,7 @@ class EnhancedCaptchaSolver:
                 return False, True
             
             # Step 2: Search for captcha input (multiple selectors)
+            # Increased timeout to 3000ms for better reliability
             captcha_selectors = self._get_captcha_selectors()
             
             for selector in captcha_selectors:
@@ -352,6 +374,7 @@ class EnhancedCaptchaSolver:
                 except:
                     continue
             
+            # Found keywords but no input field
             logger.warning(f"[{location}] Captcha text found but NO INPUT VISIBLE")
             return False, True
             
@@ -365,6 +388,7 @@ class EnhancedCaptchaSolver:
         
         Returns:
             (success: bool, page_type: str)
+            page_type: CAPTCHA_PAGE, CALENDAR_PAGE, TIME_SLOTS_PAGE, FORM_PAGE, SUCCESS_PAGE, UNKNOWN
         """
         import time as time_module
         
@@ -477,18 +501,22 @@ class EnhancedCaptchaSolver:
         import re
         
         try:
+            # Try to find captcha div with base64 background
             captcha_div = page.locator("captcha > div").first
             
             if not captcha_div.is_visible(timeout=2000):
                 logger.debug(f"[{location}] Captcha div not visible")
                 return None
             
+            # Get the style attribute
             style = captcha_div.get_attribute("style")
             
             if not style:
                 logger.debug(f"[{location}] No style attribute on captcha div")
                 return None
             
+            # Extract base64 from: background:white url('data:image/jpg;base64,XXXXX') 
+            # Pattern matches the base64 data
             pattern = r"url\(['\"]?data:image/[^;]+;base64,([A-Za-z0-9+/=]+)['\"]?\)"
             match = re.search(pattern, style)
             
@@ -497,6 +525,8 @@ class EnhancedCaptchaSolver:
                 return None
             
             base64_data = match.group(1)
+            
+            # Decode base64 to bytes
             image_bytes = base64.b64decode(base64_data)
             
             logger.info(f"[{location}] Extracted captcha from base64 ({len(image_bytes)} bytes)")
@@ -515,10 +545,12 @@ class EnhancedCaptchaSolver:
         Returns:
             Image bytes or None
         """
+        # Method 1: Try base64 extraction first (most reliable for this website)
         image_bytes = self._extract_base64_captcha(page, location)
         if image_bytes:
             return image_bytes
         
+        # Method 2: Fallback to screenshot
         for img_selector in self._get_captcha_image_selectors():
             try:
                 element = page.locator(img_selector).first
@@ -538,7 +570,7 @@ class EnhancedCaptchaSolver:
         Black captcha = session is POISONED and needs to be recreated
         
         Black captcha indicators:
-        - Very small file size (< 2000 bytes)
+        - Very small file size (< 2000 bytes) - includes 931 bytes black images
         - Normal captcha is typically 5000+ bytes
         
         CRITICAL: If detected, DO NOT RETRY! Abort session immediately.
@@ -546,6 +578,7 @@ class EnhancedCaptchaSolver:
         if len(image_bytes) < 2000:
             logger.critical(f"⛔ [BLACK CAPTCHA] Detected! Size: {len(image_bytes)} bytes - Session POISONED!")
             return True
+        
         return False
     
     def validate_captcha_result(self, code: str, location: str = "VALIDATE") -> Tuple[bool, str]:
@@ -560,33 +593,41 @@ class EnhancedCaptchaSolver:
         
         Returns:
             (is_valid: bool, status: str)
+            status: VALID, AGING, INVALID, BLACK_DETECTED, TOO_SHORT, TOO_LONG
         """
         if not code:
             logger.warning(f"[{location}] Empty captcha code")
             return False, "EMPTY"
         
+        # Clean the code
         code = code.strip().replace(" ", "")
         code_len = len(code)
         
+        # Detect black captcha garbage patterns
+        # Only truly repeated patterns like "4444", "333", "0000" are garbage
         black_patterns = ["4333", "333", "444", "1111", "0000", "4444", "3333"]
-        is_all_same = len(set(code)) == 1
+        is_all_same = len(set(code)) == 1  # All characters are the same
         if code in black_patterns or is_all_same:
             logger.critical(f"[{location}] BLACK CAPTCHA pattern detected: '{code}'")
             return False, "BLACK_DETECTED"
         
+        # Check length
         if code_len < 4:
             logger.warning(f"[{location}] Captcha too short: '{code}' ({code_len} chars)")
             return False, "TOO_SHORT"
         
         if code_len == 6:
+            # Perfect! Normal captcha
             logger.info(f"[{location}] Valid 6-char captcha: '{code}'")
             return True, "VALID"
         
         if code_len == 7:
+            # Warning - session aging, but still usable
             logger.warning(f"[{location}] 7-char captcha (session aging): '{code}'")
             return True, "AGING_7"
         
         if code_len == 8:
+            # Critical warning - session near death
             logger.warning(f"[{location}] 8-char captcha (session near death): '{code}'")
             return True, "AGING_8"
         
@@ -594,11 +635,11 @@ class EnhancedCaptchaSolver:
             logger.error(f"[{location}] Captcha too long: '{code}' ({code_len} chars)")
             return False, "TOO_LONG"
         
+        # 4-5 chars - REJECT! Embassy requires exactly 6 chars
+        # OCR probably missed a character
         if code_len in [4, 5]:
-            logger.warning(f"[{location}] OCR incomplete: '{code}' ({code_len} chars) -需要6个字符!")
+            logger.warning(f"[{location}] OCR incomplete: '{code}' ({code_len} chars) - نیاز به 6 کاراکتر!")
             return False, "TOO_SHORT"
-        
-        return False, "UNKNOWN"
 
     def _preprocess_image(self, image_bytes: bytes) -> bytes:
         """
@@ -615,14 +656,21 @@ class EnhancedCaptchaSolver:
             nparr = np.frombuffer(image_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             
+            # 1. Grayscale
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            
+            # 2. Strong Upscale (2.5x) - From V1
             gray = cv2.resize(gray, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
             
+            # 3. Strong Contrast (CLAHE) - From V1
+            # This makes faint text visible
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
             gray = clahe.apply(gray)
             
+            # 4. Thresholding
             _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             
+            # 5. Denoising - From V1
             kernel = np.ones((2,2), np.uint8)
             opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
             
@@ -631,44 +679,59 @@ class EnhancedCaptchaSolver:
         except Exception as e:
             logger.debug(f"Image preprocessing failed: {e}")
             return image_bytes
-
+    
     def solve(self, image_bytes: bytes, location: str = "SOLVE") -> Tuple[str, str]:
         """
         Solve captcha from image bytes with validation
         
         STRATEGY UPDATE: Always Enhance First (Accuracy Over Speed)
+        Since the raw image often results in "TOO_SHORT" or failures,
+        we skip the raw attempt and go straight to the enhanced version.
         
         Returns:
             (captcha_code: str, status: str)
+            status: VALID, AGING_7, AGING_8, BLACK_DETECTED, TOO_SHORT, etc.
         """
         if self.manual_only:
-            logger.info(f"[{location}] Manual Mode active - Skipping OCR")
-            return "", "MANUAL_REQUIRED"
+             logger.info(f"[{location}] Manual Mode active - Skipping OCR")
+             return "", "MANUAL_REQUIRED"
 
-        if not self.ocr:
-            logger.error("[OCR] Engine not initialized")
+        if not self.ocr_method:
+            logger.error("[OCR] OCR method not initialized")
             return "", "NO_OCR"
         
         try:
+            # Detect black captcha first (by image size)
             if self.detect_black_captcha(image_bytes):
                 return "", "BLACK_IMAGE"
             
+            # ALWAYS PREPROCESS FIRST
+            # Upscale + Contrast Enhancement for maximum accuracy
             enhanced_bytes = self._preprocess_image(image_bytes)
             
-            if Config.PARALLEL_SOLVING_ENABLED and self.capsolver.enabled and self.ocr:
-                logger.info(f"[{location}] 🚀 STARTING PARALLEL RACE: CapSolver vs Local OCR")
-                
-                with ThreadPoolExecutor(max_workers=2) as executor:
+            # ═══════════════════════════════════════════════════════════════
+            # STRATEGY: PARALLEL SOLVING (RACE) vs SEQUENTIAL
+            # ═══════════════════════════════════════════════════════════════
+            
+            if Config.PARALLEL_SOLVING_ENABLED and self.capsolver.enabled and self.ocr_method:
+                 logger.info(f"[{location}] 🚀 STARTING PARALLEL RACE: CapSolver vs Local OCR")
+                 
+                 with ThreadPoolExecutor(max_workers=2) as executor:
+                    # Submit tasks
                     future_capsolver = executor.submit(self.capsolver.solve_image_to_text, enhanced_bytes, location)
+                    # For local OCR, we wrap it in a lambda or simple call
                     future_local = executor.submit(self._solve_local_ocr, enhanced_bytes, location)
                     
                     futures = [future_capsolver, future_local]
                     
+                    # Wait for FIRST COMPLETED
                     for future in as_completed(futures):
                         try:
                             result_code, result_status = future.result()
                             
+                            # If successful result, return immediately!
                             if result_code and result_status in ["SUCCESS", "VALID", "AGING_7", "AGING_8"]:
+                                # Clean and Validate again to be sure (double check)
                                 final_code = self._clean_ocr_result(result_code)
                                 is_valid, val_status = self.validate_captcha_result(final_code, f"{location}_PARALLEL")
                                 
@@ -677,27 +740,37 @@ class EnhancedCaptchaSolver:
                                     return final_code, result_status
                         except Exception as e:
                             logger.error(f"Parallel task failed: {e}")
+                            
+                    # If we fall through here, it means the first finished task failed.
+                    # We should wait for the second one? 
+                    # Simpler logic: If the first one failed, check if the other is done or wait for it.
+                    # Ideally wait for ALL if first fails.
                     
+                    # Let's try collecting all results if the first one wasn't a winner
                     logger.warning(f"[{location}] First parallel result wasn't a winner - checking others...")
                     
                     for future in futures:
-                        if future.done():
-                            continue
+                        if future.done(): continue # Already checked
                         try:
-                            result_code, result_status = future.result()
+                            result_code, result_status = future.result() # Wait for the slower one
                             if result_code and result_status in ["SUCCESS", "VALID", "AGING_7", "AGING_8"]:
                                 final_code = self._clean_ocr_result(result_code)
                                 is_valid, val_status = self.validate_captcha_result(final_code, f"{location}_PARALLEL_SLOW")
                                 if is_valid:
                                     logger.info(f"[{location}] 🥈 RUNNER-UP WON: {result_status} -> '{final_code}'")
                                     return final_code, result_status
-                        except:
-                            pass
-                            
-                logger.warning(f"[{location}] 🏁 Parallel race ended with NO WINNER")
-                return "", "ALL_FAILED"
+                        except: pass
+                        
+                 logger.warning(f"[{location}] 🏁 Parallel race ended with NO WINNER")
+                 return "", "ALL_FAILED"
 
+            # ═══════════════════════════════════════════════════════════════
+            # STRATEGY: SEQUENTIAL (FALLBACK)
+            # ═══════════════════════════════════════════════════════════════
+
+            # PRIORITY 1: CAPSOLVER (PAID/PREMIUM)
             if self.capsolver.enabled:
+                # Send Enhanced Image directly
                 code, status = self.capsolver.solve_image_to_text(enhanced_bytes, location)
                 
                 if code and status == "SUCCESS":
@@ -714,10 +787,11 @@ class EnhancedCaptchaSolver:
                 
                 logger.warning(f"[{location}] CapSolver failed - Falling back to local OCR...")
 
-            if self.ocr:
-                result, status = self._solve_local_ocr(enhanced_bytes, location)
-                if status in ["VALID", "AGING_7", "AGING_8"]:
-                    return result, status
+            # PRIORITY 2: LOCAL DDDDOCR (FREE/FALLBACK)
+            if self.ocr_method:
+                 result, status = self._solve_local_ocr(enhanced_bytes, location)
+                 if status in ["VALID", "AGING_7", "AGING_8"]:
+                     return result, status
                         
             return "", "ALL_FAILED"
 
@@ -726,29 +800,23 @@ class EnhancedCaptchaSolver:
             return "", "ERROR"
 
     def _solve_local_ocr(self, image_bytes: bytes, location: str) -> Tuple[str, str]:
-        """
-        Helper for local OCR solving (thread-safe wrapper)
-        
-        ═══════════════════════════════════════════════════════════════
-        FIX #1: استخدام classification() بدلاً من predict()
-        ═══════════════════════════════════════════════════════════════
-        """
+        """Helper for local OCR solving (thread-safe wrapper)"""
         try:
-            logger.info(f"[{location}] Trying local ddddocr (Enhanced)...")
-            
-            # الإصلاح الرئيسي هنا - استخدام classification() بدلاً من predict()
-            result = self.ocr.classification(image_bytes)
+             logger.info(f"[{location}] Trying local ddddocr (Enhanced)...")
+             
+             # Use the pre-detected OCR method for compatibility
+             result = self.ocr_method(image_bytes)
 
-            result = result.replace(" ", "").strip().lower()
-            result = self._clean_ocr_result(result)
-            is_valid, status = self.validate_captcha_result(result, location)
-            
-            if is_valid:
-                logger.info(f"[{location}] Local OCR solved: '{result}' - Status: {status}")
-                return result, status
-            else:
-                logger.warning(f"[{location}] Local OCR failed: '{result}' - Status: {status}")
-                return result, status
+             result = result.replace(" ", "").strip().lower()
+             result = self._clean_ocr_result(result)
+             is_valid, status = self.validate_captcha_result(result, location)
+             
+             if is_valid:
+                 logger.info(f"[{location}] Local OCR solved: '{result}' - Status: {status}")
+                 return result, status
+             else:
+                 logger.warning(f"[{location}] Local OCR failed: '{result}' - Status: {status}")
+                 return result, status
         except Exception as e:
             logger.error(f"Local OCR Error: {e}")
             return "", "ERROR"
@@ -765,8 +833,10 @@ class EnhancedCaptchaSolver:
         if not text:
             return ""
             
+        # 1. Basic cleanup
         text = text.strip().replace(" ", "")
         
+        # 2. Filter allowed characters only (alphanumeric)
         allowed_chars = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
         cleaned = ''.join(c for c in text if c in allowed_chars)
         
@@ -780,6 +850,7 @@ class EnhancedCaptchaSolver:
             (success: bool, captcha_code: Optional[str], status: str)
         """
         try:
+            # Check if captcha exists
             has_captcha, check_ok = self.safe_captcha_check(page, location)
             
             if not check_ok:
@@ -790,20 +861,24 @@ class EnhancedCaptchaSolver:
                 logger.debug(f"[{location}] No captcha to pre-solve")
                 return True, None, "NO_CAPTCHA"
             
+            # Find captcha image using unified method
             image_bytes = self._get_captcha_image(page, location)
             
             if not image_bytes:
                 logger.warning(f"[{location}] Captcha image not found for pre-solve")
                 return False, None, "NO_IMAGE"
             
+            # Solve captcha with validation
             code, status = self.solve(image_bytes, location)
             
             if not code:
                 logger.warning(f"[{location}] Pre-solve failed: {status}")
                 return False, None, status
             
+            # Cache the solution
             self._pre_solved_code = code
             self._pre_solved_time = time.time()
+            self._pre_solved_status = status
             
             logger.info(f"[{location}] Pre-solved captcha: '{code}' - Status: {status}")
             return True, code, status
@@ -822,6 +897,7 @@ class EnhancedCaptchaSolver:
         if not self._pre_solved_code:
             return None
         
+        # Check if expired
         age = time.time() - self._pre_solved_time
         if age > self._pre_solve_timeout:
             logger.warning("Pre-solved captcha expired")
@@ -852,6 +928,7 @@ class EnhancedCaptchaSolver:
             (success: bool, captcha_code: Optional[str], status: str)
         """
         try:
+            # Check if captcha exists
             has_captcha, check_ok = self.safe_captcha_check(page, location)
             
             if not check_ok:
@@ -862,6 +939,7 @@ class EnhancedCaptchaSolver:
                 logger.debug(f"[{location}] No captcha present")
                 return True, None, "NO_CAPTCHA"
             
+            # Find captcha input field
             input_selector = None
             for selector in self._get_captcha_selectors():
                 try:
@@ -875,6 +953,7 @@ class EnhancedCaptchaSolver:
                 logger.warning(f"[{location}] Captcha input not found")
                 return False, None, "NO_INPUT"
             
+            # Check for pre-solved code first
             code = self.get_pre_solved()
             status = getattr(self, '_pre_solved_status', 'VALID')
             
@@ -882,35 +961,47 @@ class EnhancedCaptchaSolver:
                 logger.info(f"[{location}] Using pre-solved captcha: '{code}'")
                 self.clear_pre_solved()
             else:
+                # [UPDATED] Internal Retry Loop for AUTO mode accuracy
                 internal_max_retries = 3
                 for internal_attempt in range(internal_max_retries):
                     
+                    # Find captcha image using unified method
                     image_bytes = self._get_captcha_image(page, location)
                     
                     if not image_bytes:
                         logger.warning(f"[{location}] Captcha image not found")
                         return False, None, "NO_IMAGE"
                     
+                    # Solve captcha with OCR validation
                     code, status = self.solve(image_bytes, location)
                     
+                    # ═══════════════════════════════════════════════════════════════
+                    # EXECUTION MODE LOGIC
+                    # ═══════════════════════════════════════════════════════════════
+                    
+                    # 1. AUTO MODE: Smart Retry for TOO_SHORT
                     if self.auto_only:
                         if status == "TOO_SHORT":
                             logger.warning(f"[{location}] Result TOO_SHORT in AUTO mode - RELOADING ({internal_attempt+1}/{internal_max_retries})...")
                             if internal_attempt < internal_max_retries - 1:
                                 self.reload_captcha(page, f"{location}_RELOAD_{internal_attempt}")
-                                continue
+                                continue # NEXT TRY via loop
                             else:
                                 logger.warning(f"[{location}] Max internal retries reached for TOO_SHORT")
+                                # Fall through to skip logic
                         
                         if not code or status in ["TOO_SHORT", "TOO_LONG", "NO_OCR", "MANUAL_REQUIRED"]:
                             logger.warning(f"[{location}] OCR failed ({status}) and Mode is AUTO - SKIPPING MANUAL")
                             return False, None, f"AUTO_SKIP_{status}"
                         
+                        # If we have a code (VALID, AGING, etc.), break loop and submit
                         break
                     
+                    # 2. HYBRID/MANUAL MODE: If OCR fails (or skipped in MANUAL), try Telegram
                     if not code or status in ["TOO_SHORT", "TOO_LONG", "NO_OCR", "MANUAL_REQUIRED"]:
                         logger.info(f"[{location}] OCR failed ({status}), trying manual Telegram...")
                     
+                    # Request manual solution via Telegram
                     manual_code = self.manual_handler.request_manual_solution(
                         image_bytes=image_bytes,
                         location=location,
@@ -927,6 +1018,7 @@ class EnhancedCaptchaSolver:
                         logger.warning(f"[{location}] Manual solve also failed/timeout")
                         return False, None, "MANUAL_TIMEOUT"
             
+            # Fill captcha (Force write for reliability)
             try:
                 page.fill(input_selector, code, timeout=3000, force=True)
                 logger.info(f"[{location}] Captcha filled: '{code}' - Status: {status}")
@@ -946,7 +1038,9 @@ class EnhancedCaptchaSolver:
         try:
             logger.info(f"[CAPTCHA] Submitting answer (Method: {method})...")
             
+            # 1. Try generic submit buttons first if method is auto or click
             if method in ["auto", "click"]:
+                # Specific buttons for this appointment system
                 buttons = [
                     "input[name='submit']",
                     "input[value='Weiter']",
@@ -966,6 +1060,7 @@ class EnhancedCaptchaSolver:
                     except:
                         continue
             
+            # 2. Fallback to Enter key (or if method='enter')
             page.keyboard.press("Enter")
             logger.info("Sent Enter key")
             return True
@@ -978,69 +1073,70 @@ class EnhancedCaptchaSolver:
         """
         Verify if captcha was solved successfully by checking if we moved to next page
         or if captcha is still present.
-        
-        ═══════════════════════════════════════════════════════════════
-        FIX #2: Added proper wait for navigation to complete before checking page content.
-        ═══════════════════════════════════════════════════════════════
         """
         logger.info(f"[{location}] Verifying captcha solution...")
         
+        # Give it time to load - use extended timeout for manual mode
         start_time = time.time()
         timeout = 10.0 if getattr(self, 'manual_only', False) else 5.0
-        
-        # انتظار اكتمال التنقل قبل قراءة المحتوى
-        try:
-            page.wait_for_load_state("networkidle", timeout=3000)
-        except Exception:
-            pass
         
         while time.time() - start_time < timeout:
             try:
                 current_url = page.url
-                
-                # Wrap content access in try-except to handle navigation state
+                # Safe access to content - if navigating, this might fail, which is fine
                 try:
-                    page.wait_for_load_state("domcontentloaded", timeout=2000)
                     content = page.content().lower()
                 except Exception:
-                    # Page is likely navigating/loading - wait and retry
+                    # Page is likely navigating/loading - this is actually a good sign!
                     time.sleep(0.5)
                     continue
 
+                # 1. Check if we moved to Day view (Success)
                 if "appointment_showday" in current_url.lower() or page.locator("a.arrow").count() > 0:
-                    return True, "DAY_PAGE"
+                     return True, "DAY_PAGE"
                 
+                # 2. Check for form page (Success)
                 if "appointment_showform" in current_url.lower():
                     return True, "FORM_PAGE"
 
+                # 3. Check for explicitly wrong captcha error
                 if "security code" in content and ("valid" in content or "match" in content or "nicht korrekt" in content):
-                    logger.warning(f"[{location}] Server reported WRONG captcha")
-                    return False, "WRONG_CAPTCHA"
+                     logger.warning(f"[{location}] Server reported WRONG captcha")
+                     return False, "WRONG_CAPTCHA"
 
             except Exception as e:
                 logger.debug(f"[{location}] Verification check transient error: {e}")
             
             time.sleep(0.5)
             
+        # If we are still here, check if captcha is still visible
         has_captcha, _ = self.safe_captcha_check(page, location)
         if has_captcha:
-            return False, "CAPTCHA_STILL_PRESENT"
+             return False, "CAPTCHA_STILL_PRESENT"
              
+        # If captcha is gone but we aren't on success page, assume success for now (maybe loading)
         return True, "UNKNOWN_PAGE"
 
     def reload_captcha(self, page: Page, location: str = "RELOAD") -> bool:
         """
         Reload captcha image by clicking "Load another picture" button.
+        This is used when captcha solving fails - instead of going back to start,
+        we just reload and try again.
         
         Returns:
             True if reload was successful
         """
         try:
+            # FACT-BASED SELECTORS from RK-Termin form.html
             reload_selectors = [
+                # 1. The exact ID from the booking form (RK-Termin form.html)
                 "#appointment_newAppointmentForm_form_newappointment_refreshcaptcha",
+                # 2. The name attribute from the booking form
                 "input[name='action:appointment_refreshCaptcha']",
+                # 3. The exact ID from the category form (RK-Termin - Kategorie.html)
                 "#appointment_captcha_month_refreshcaptcha",
                 "input[name='action:appointment_refreshCaptchamonth']",
+                # 4. Fallbacks based on value (confirmed "Load another picture")
                 "input[value='Load another picture']",
                 "input[value='Bild laden']"
             ]
@@ -1049,9 +1145,11 @@ class EnhancedCaptchaSolver:
                 try:
                     button = page.locator(selector).first
                     if button.is_visible(timeout=1000):
+                        # Try regular click first
                         try:
                             button.click(timeout=2000)
                         except:
+                            # JavaScript fallback click
                             page.evaluate(f'document.querySelector("{selector}")?.click()')
                         
                         logger.info(f"[{location}] Clicked reload button - waiting for new captcha...")
@@ -1060,6 +1158,7 @@ class EnhancedCaptchaSolver:
                 except:
                     continue
             
+            # Final fallback: Try JavaScript to find any reload-related button
             try:
                 result = page.evaluate("""
                     const buttons = Array.from(document.querySelectorAll('input[type="submit"], button'));
@@ -1100,6 +1199,9 @@ class EnhancedCaptchaSolver:
         When captcha solving fails, instead of returning to start,
         it clicks "Load another picture" and tries again.
         
+        This is the SMART logic: we don't lose our valuable slot by going back,
+        we just reload the captcha and try again until we succeed.
+        
         Args:
             page: Playwright page
             location: Log location identifier
@@ -1110,45 +1212,50 @@ class EnhancedCaptchaSolver:
         """
         if self.manual_only:
             logger.info("🛠️ MANUAL MODE: Enabling INFINITE RETRY loop on form page!")
-            max_attempts = 1000
+            max_attempts = 1000  # Virtually infinite for manual mode
             
         for attempt in range(max_attempts):
             attempt_num = attempt + 1
             
             logger.info(f"[{location}] Captcha attempt {attempt_num}/{max_attempts}")
             
+            # Try to solve
             success, code, status = self.solve_from_page(
                 page, 
                 f"{location}_A{attempt_num}",
                 session_age=session_age,
                 attempt=attempt_num,
-                max_attempts=1
+                max_attempts=1 # Inside the loop we scan once per cycle
             )
             
             if success and code:
+                # Got a valid solution!
                 logger.info(f"[{location}] SUCCESS on attempt {attempt_num}: '{code}'")
                 return True, code, status
             
-            if attempt < max_attempts - 1:
+            # Failed - try to reload captcha
+            if attempt < max_attempts - 1:  # Don't reload on last attempt
                 logger.warning(f"[{location}] Attempt {attempt_num} failed ({status}), reloading captcha...")
                 
-                if session_age > 1800:
-                    logger.critical(f"[{location}] Session too old during infinite loop - aborting")
-                    return False, None, "SESSION_TOO_OLD"
+                # Check session age to prevent zombie loops
+                if session_age > 1800: # 30 minutes
+                     logger.critical(f"[{location}] Session too old during infinite loop - aborting")
+                     return False, None, "SESSION_TOO_OLD"
 
                 if not self.reload_captcha(page, f"{location}_RELOAD"):
                     logger.error(f"[{location}] Could not reload captcha - aborting")
+                    # If reload click fails (button gone?), we might have lost the page. Return False.
                     return False, None, "RELOAD_FAILED"
                 
+                # Small delay after reload
                 time.sleep(1.0)
         
+        # All attempts failed
         logger.error(f"[{location}] All {max_attempts} attempts failed")
         return False, None, "MAX_ATTEMPTS_REACHED"
 
 
-# ═══════════════════════════════════════════════════════════════
-# Backward compatibility - للكود القديم
-# ═══════════════════════════════════════════════════════════════
+# Backward compatibility
 class CaptchaSolver:
     """Original captcha solver for backward compatibility"""
     
@@ -1162,10 +1269,11 @@ class CaptchaSolver:
         if not self.ocr:
             return ""
         try:
-            # ═══════════════════════════════════════════════════════════════
-            # FIX #3: استخدام classification() بدلاً من predict()
-            # ═══════════════════════════════════════════════════════════════
-            res = self.ocr.classification(image_bytes)
+            # Use classification method for new versions, fallback to predict for old versions
+            if hasattr(self.ocr, 'classification'):
+                res = self.ocr.classification(image_bytes)
+            else:
+                res = self.ocr.predict(image_bytes)
             res = res.replace(" ", "").strip()
             print(f"[AI] Captcha Solved: {res}")
             return res
