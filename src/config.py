@@ -116,7 +116,7 @@ class Config:
     MAX_EVIDENCE_AGE_HOURS = 48  # Auto-cleanup after 48 hours
 
     # ==================== Development ====================
-    DRY_RUN = False # FORCE TRUE FOR TESTING
+    DRY_RUN = "false" # FORCE TRUE FOR TESTING
     
     # ==================== Execution Mode ====================
     # AUTO, MANUAL, HYBRID
